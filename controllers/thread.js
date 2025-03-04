@@ -1,101 +1,95 @@
+// controllers/thread.js - Update these methods to use the new fileStorage system
 const supabase = require('../config/supabase');
 const { generateTripcode, verifyTripcode } = require('../utils/fileUtils');
+const fileStorage = require('../utils/fileStorage');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
 
-/**
- * Get all threads (paginated)
- */
-exports.getThreads = async (req, res) => {
-  try {
-    // Pagination parameters
-    const page = parseInt(req.query.page) || 1;
-    const pageSize = parseInt(req.query.pageSize) || 15;
-    const offset = (page - 1) * pageSize;
-
-    // Query threads ordered by bump time
-    const { data: threads, error, count } = await supabase
-      .from('threads')
-      .select('*', { count: 'exact' })
-      .order('bumped_at', { ascending: false })
-      .range(offset, offset + pageSize - 1);
-
-    if (error) throw error;
-
-    // Get preview posts for each thread (up to 3 most recent replies)
-    const threadsWithPreviews = await Promise.all(
-      threads.map(async (thread) => {
-        const { data: posts } = await supabase
-          .from('posts')
-          .select('*')
-          .eq('thread_id', thread.id)
-          .order('created_at', { ascending: false })
-          .limit(3);
-
-        return {
-          ...thread,
-          preview_posts: posts || []
-        };
-      })
-    );
-
-    // Return paginated results
-    res.json({
-      threads: threadsWithPreviews,
-      pagination: {
-        total: count,
-        page,
-        pageSize,
-        totalPages: Math.ceil(count / pageSize)
-      }
-    });
-  } catch (err) {
-    console.error('Error fetching threads:', err);
-    res.status(500).json({ error: 'Failed to fetch threads' });
-  }
-};
-
-/**
- * Get a specific thread with all its replies
- */
 exports.getThread = async (req, res) => {
-  try {
-    const threadId = req.params.id;
-
-    // Get thread data
-    const { data: thread, error: threadError } = await supabase
-      .from('threads')
-      .select('*')
-      .eq('id', threadId)
-      .single();
-
-    if (threadError) {
-      if (threadError.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Thread not found' });
+    try {
+      const threadId = req.params.id;
+  
+      // Get thread data
+      const { data: thread, error: threadError } = await supabase
+        .from('threads')
+        .select('*')
+        .eq('id', threadId)
+        .single();
+  
+      if (threadError) {
+        if (threadError.code === 'PGRST116') {
+          return res.status(404).json({ error: 'Thread not found' });
+        }
+        throw threadError;
       }
-      throw threadError;
+  
+      // Get all posts in the thread
+      const { data: posts, error: postsError } = await supabase
+        .from('posts')
+        .select('*')
+        .eq('thread_id', threadId)
+        .order('created_at', { ascending: true });
+  
+      if (postsError) throw postsError;
+  
+      // Return thread with its posts
+      res.json({
+        thread,
+        posts: posts || []
+      });
+    } catch (err) {
+      console.error('Error fetching thread:', err);
+      res.status(500).json({ error: 'Failed to fetch thread' });
     }
+  };
 
-    // Get all posts in the thread
-    const { data: posts, error: postsError } = await supabase
-      .from('posts')
-      .select('*')
-      .eq('thread_id', threadId)
-      .order('created_at', { ascending: true });
-
-    if (postsError) throw postsError;
-
-    // Return thread with its posts
-    res.json({
-      thread,
-      posts: posts || []
-    });
-  } catch (err) {
-    console.error('Error fetching thread:', err);
-    res.status(500).json({ error: 'Failed to fetch thread' });
-  }
-};
+exports.getThreads = async (req, res) => {
+    try {
+      // Pagination parameters
+      const page = parseInt(req.query.page) || 1;
+      const pageSize = parseInt(req.query.pageSize) || 15;
+      const offset = (page - 1) * pageSize;
+  
+      // Query threads ordered by bump time
+      const { data: threads, error, count } = await supabase
+        .from('threads')
+        .select('*', { count: 'exact' })
+        .order('bumped_at', { ascending: false })
+        .range(offset, offset + pageSize - 1);
+  
+      if (error) throw error;
+  
+      // Get preview posts for each thread (up to 3 most recent replies)
+      const threadsWithPreviews = await Promise.all(
+        threads.map(async (thread) => {
+          const { data: posts } = await supabase
+            .from('posts')
+            .select('*')
+            .eq('thread_id', thread.id)
+            .order('created_at', { ascending: false })
+            .limit(3);
+  
+          return {
+            ...thread,
+            preview_posts: posts || []
+          };
+        })
+      );
+  
+      // Return paginated results
+      res.json({
+        threads: threadsWithPreviews,
+        pagination: {
+          total: count,
+          page,
+          pageSize,
+          totalPages: Math.ceil(count / pageSize)
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching threads:', err);
+      res.status(500).json({ error: 'Failed to fetch threads' });
+    }
+  };
 
 /**
  * Create a new thread
@@ -103,7 +97,7 @@ exports.getThread = async (req, res) => {
 exports.createThread = async (req, res) => {
   try {
     const { subject, comment, name = 'Anonymous', password, is_nsfw } = req.body;
-    const file = req.file;
+    const fileData = req.fileData; // From our updated middleware
     const ipAddress = req.ip || req.headers['x-forwarded-for'];
 
     // Generate tripcode if password is provided
@@ -126,12 +120,13 @@ exports.createThread = async (req, res) => {
     };
 
     // Handle file upload if present
-    if (file) {
-      threadData.file_name = file.originalname;
-      threadData.file_path = file.path.replace(/\\/g, '/');
-      threadData.file_size = file.size;
-      threadData.file_type = file.mimetype;
-      threadData.thumbnail_path = file.thumbnailPath ? file.thumbnailPath.replace(/\\/g, '/') : null;
+    if (fileData) {
+      threadData.file_name = fileData.fileName;
+      threadData.file_path = fileData.filePath;
+      threadData.file_size = fileData.fileSize;
+      threadData.file_type = fileData.fileType;
+      threadData.thumbnail_path = fileData.thumbnailPath;
+      threadData.storage_path = fileData.storagePath; // Store for later deletion
       threadData.images_count = 1;
     }
 
@@ -150,16 +145,12 @@ exports.createThread = async (req, res) => {
   } catch (err) {
     console.error('Error creating thread:', err);
     
-    // Clean up uploaded file on error
-    if (req.file) {
-      try {
-        fs.unlinkSync(req.file.path);
-        if (req.file.thumbnailPath) {
-          fs.unlinkSync(req.file.thumbnailPath);
-        }
-      } catch (e) {
-        console.error('Error cleaning up files:', e);
-      }
+    // Clean up uploaded file on error if it exists
+    if (req.fileData && req.fileData.storagePath) {
+      await fileStorage.deleteFile(
+        req.fileData.storagePath, 
+        req.fileData.thumbnailPath
+      );
     }
     
     res.status(500).json({ error: 'Failed to create thread' });
@@ -173,7 +164,7 @@ exports.replyToThread = async (req, res) => {
   try {
     const threadId = req.params.id;
     const { comment, name = 'Anonymous', password, is_nsfw, reply_to } = req.body;
-    const file = req.file;
+    const fileData = req.fileData; // From our updated middleware
     const ipAddress = req.ip || req.headers['x-forwarded-for'];
 
     // Verify thread exists
@@ -210,12 +201,13 @@ exports.replyToThread = async (req, res) => {
     };
 
     // Handle file upload if present
-    if (file) {
-      postData.file_name = file.originalname;
-      postData.file_path = file.path.replace(/\\/g, '/');
-      postData.file_size = file.size;
-      postData.file_type = file.mimetype;
-      postData.thumbnail_path = file.thumbnailPath ? file.thumbnailPath.replace(/\\/g, '/') : null;
+    if (fileData) {
+      postData.file_name = fileData.fileName;
+      postData.file_path = fileData.filePath;
+      postData.file_size = fileData.fileSize;
+      postData.file_type = fileData.fileType;
+      postData.thumbnail_path = fileData.thumbnailPath;
+      postData.storage_path = fileData.storagePath; // Store for later deletion
     }
 
     // Insert post into database
@@ -226,6 +218,12 @@ exports.replyToThread = async (req, res) => {
 
     if (error) throw error;
 
+    // Update thread's bump time
+    await supabase
+      .from('threads')
+      .update({ bumped_at: new Date() })
+      .eq('id', threadId);
+
     res.status(201).json({
       message: 'Reply posted successfully',
       post: data[0]
@@ -233,16 +231,12 @@ exports.replyToThread = async (req, res) => {
   } catch (err) {
     console.error('Error creating reply:', err);
     
-    // Clean up uploaded file on error
-    if (req.file) {
-      try {
-        fs.unlinkSync(req.file.path);
-        if (req.file.thumbnailPath) {
-          fs.unlinkSync(req.file.thumbnailPath);
-        }
-      } catch (e) {
-        console.error('Error cleaning up files:', e);
-      }
+    // Clean up uploaded file on error if it exists
+    if (req.fileData && req.fileData.storagePath) {
+      await fileStorage.deleteFile(
+        req.fileData.storagePath, 
+        req.fileData.thumbnailPath
+      );
     }
     
     res.status(500).json({ error: 'Failed to post reply' });
@@ -289,37 +283,30 @@ exports.deleteThread = async (req, res) => {
     if (error) throw error;
 
     // Clean up files
-    if (thread.file_path) {
-      try {
-        fs.unlinkSync(path.join(__dirname, '..', thread.file_path));
-        if (thread.thumbnail_path) {
-          fs.unlinkSync(path.join(__dirname, '..', thread.thumbnail_path));
+    if (thread.storage_path) {
+      await fileStorage.deleteFile(thread.storage_path, thread.thumbnail_path);
+    }
+
+    // Get all posts in the thread and their file paths
+    const { data: posts } = await supabase
+      .from('posts')
+      .select('storage_path, thumbnail_path')
+      .eq('thread_id', threadId);
+
+    // Delete all post files
+    if (posts && posts.length > 0) {
+      for (const post of posts) {
+        if (post.storage_path) {
+          await fileStorage.deleteFile(post.storage_path, post.thumbnail_path);
         }
-      } catch (e) {
-        console.error('Error cleaning up files:', e);
       }
     }
 
-    // Also clean up all posts' files
-    const { data: posts } = await supabase
+    // Delete all posts from the thread (cascade should handle this in DB)
+    await supabase
       .from('posts')
-      .select('file_path, thumbnail_path')
+      .delete()
       .eq('thread_id', threadId);
-
-    if (posts) {
-      posts.forEach(post => {
-        if (post.file_path) {
-          try {
-            fs.unlinkSync(path.join(__dirname, '..', post.file_path));
-            if (post.thumbnail_path) {
-              fs.unlinkSync(path.join(__dirname, '..', post.thumbnail_path));
-            }
-          } catch (e) {
-            console.error('Error cleaning up post files:', e);
-          }
-        }
-      });
-    }
 
     res.json({ message: 'Thread deleted successfully' });
   } catch (err) {
@@ -368,15 +355,8 @@ exports.deletePost = async (req, res) => {
     if (error) throw error;
 
     // Clean up files
-    if (post.file_path) {
-      try {
-        fs.unlinkSync(path.join(__dirname, '..', post.file_path));
-        if (post.thumbnail_path) {
-          fs.unlinkSync(path.join(__dirname, '..', post.thumbnail_path));
-        }
-      } catch (e) {
-        console.error('Error cleaning up files:', e);
-      }
+    if (post.storage_path) {
+      await fileStorage.deleteFile(post.storage_path, post.thumbnail_path);
     }
 
     // Update thread counts
@@ -393,21 +373,18 @@ exports.deletePost = async (req, res) => {
   }
 };
 
-/**
- * Get board statistics
- */
 exports.getBoardStats = async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('board_stats')
-      .select('*')
-      .single();
-
-    if (error) throw error;
-
-    res.json(data);
-  } catch (err) {
-    console.error('Error fetching board stats:', err);
-    res.status(500).json({ error: 'Failed to fetch board statistics' });
-  }
-};
+    try {
+      const { data, error } = await supabase
+        .from('board_stats')
+        .select('*')
+        .single();
+  
+      if (error) throw error;
+  
+      res.json(data);
+    } catch (err) {
+      console.error('Error fetching board stats:', err);
+      res.status(500).json({ error: 'Failed to fetch board statistics' });
+    }
+  };

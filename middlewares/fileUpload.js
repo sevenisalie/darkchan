@@ -1,10 +1,10 @@
+// middlewares/fileUpload.js
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const sharp = require('sharp');
-const { v4: uuidv4 } = require('uuid');
+const fileStorage = require('../utils/fileStorage');
 
-// Configure upload directory
+// Create uploads directory for temporary storage
 const uploadDir = process.env.UPLOAD_DIRECTORY || './uploads';
 const thumbnailDir = path.join(uploadDir, 'thumbnails');
 
@@ -16,7 +16,7 @@ if (!fs.existsSync(thumbnailDir)) {
   fs.mkdirSync(thumbnailDir, { recursive: true });
 }
 
-// Configure storage
+// Configure disk storage for multer (temporary storage before upload to Supabase)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadDir);
@@ -24,7 +24,7 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     // Generate a unique filename while preserving extension
     const fileExt = path.extname(file.originalname);
-    const fileName = `${uuidv4()}${fileExt}`;
+    const fileName = `${Date.now()}-${Math.round(Math.random() * 1E9)}${fileExt}`;
     cb(null, fileName);
   }
 });
@@ -51,40 +51,58 @@ const upload = multer({
   }
 });
 
-// Middleware to process uploads and create thumbnails
-const processUpload = (req, res, next) => {
+// Middleware to process uploads and upload to Supabase Storage
+const processUpload = async (req, res, next) => {
   if (!req.file) {
     return next();
   }
 
-  // Generate thumbnail for images
-  const isImage = req.file.mimetype.startsWith('image/');
-  
-  if (isImage) {
-    const thumbnailPath = path.join(thumbnailDir, `thumb_${path.basename(req.file.path)}`);
+  try {
+    console.log('Processing file upload:', req.file.originalname);
     
-    // Create a 200px wide thumbnail
-    sharp(req.file.path)
-      .resize(200)
-      .toFile(thumbnailPath)
-      .then(() => {
-        // Add thumbnail path to the file object
-        req.file.thumbnailPath = thumbnailPath;
-        next();
-      })
-      .catch(err => {
-        console.error('Error creating thumbnail:', err);
-        req.file.thumbnailPath = null;
-        next();
-      });
-  } else {
-    // No thumbnail for non-image files
-    req.file.thumbnailPath = null;
+    // Extract NSFW flag from request
+    const isNsfw = req.body.is_nsfw === 'true' || req.body.is_nsfw === true;
+    
+    // Upload file to Supabase Storage
+    const fileData = await fileStorage.uploadFile(req.file, isNsfw);
+    
+    if (!fileData) {
+      console.error('File upload to Supabase failed');
+      return res.status(500).json({ error: 'Failed to upload file' });
+    }
+    
+    // Add file data to request
+    req.fileData = fileData;
+    
+    // Clean up temporary file
+    try {
+      if (req.file.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+        console.log('Temporary file deleted:', req.file.path);
+      }
+    } catch (cleanupError) {
+      console.error('Error cleaning up temporary file:', cleanupError);
+      // Don't fail the request if cleanup fails
+    }
+    
     next();
+  } catch (error) {
+    console.error('Error processing file upload:', error);
+    
+    // Clean up temporary file on error
+    try {
+      if (req.file.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+    } catch (cleanupError) {
+      console.error('Error cleaning up temporary file:', cleanupError);
+    }
+    
+    return res.status(500).json({ error: 'File upload processing failed' });
   }
 };
 
-// Create middleware that combines multer and thumbnail creation
+// Create middleware that combines multer and storage upload
 const fileUploadMiddleware = {
   single: (fieldName) => {
     return [
