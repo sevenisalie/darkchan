@@ -16,6 +16,9 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
+// This exists because Render uses a proxy to send requests to the API; The proxy sits at 1st child proxy position
+app.set('trust proxy', 1);
+
 // Rate limiting
 app.use(rateLimit);
 
